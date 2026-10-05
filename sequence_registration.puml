@@ -1,0 +1,67 @@
+@startuml
+' UML Sequence: регистрация по email и паролю с подтверждением email
+' Участники: Мобильное приложение -> Backend API -> База данных -> Email-сервис
+title Регистрация по email и паролю с подтверждением email
+autonumber
+hide footbox
+skinparam shadowing false
+skinparam responseMessageBelowArrow true
+skinparam maxMessageSize 220
+skinparam sequenceMessageAlign center
+
+actor "Пользователь" as U
+participant "Мобильное\nприложение" as APP
+participant "Backend API" as API
+database "База данных" as DB
+participant "Email-сервис" as MAIL
+
+== Регистрация ==
+U -> APP : Вводит email и пароль,\nпринимает соглашение
+APP -> APP : Проверка на устройстве:\nформат email, длина пароля
+APP -> API : POST /v1/auth/register\n{email, password, consentVersion}
+API -> API : Нормализация email,\nпроверка политики пароля
+
+alt Слабый пароль
+  API --> APP : 422 {code: WEAK_PASSWORD, rules}
+  APP --> U : Показать требования к паролю
+else Пароль соответствует политике
+  API -> DB : Найти пользователя по email
+  DB --> API : Результат поиска
+  alt Email уже существует
+    API --> APP : 409 {code: EMAIL_EXISTS}
+    APP --> U : Ошибка, предложить вход\nили восстановление пароля
+  else Email свободен
+    API -> API : Хеш пароля (Argon2id),\nкод подтверждения (6 цифр, TTL 15 мин)
+    API -> DB : Сохранить пользователя (PENDING)\nи хеш кода в одной транзакции
+    DB --> API : userId
+    note right of DB : Уникальный индекс по email:\nпри гонке INSERT тоже даст 409
+    API -> MAIL : Отправить письмо с кодом\n(таймаут 1 с)
+    alt Email-сервис ответил
+      MAIL --> API : 202 Accepted
+    else Таймаут или 5xx
+      API -> DB : Поставить письмо в очередь\nповторной отправки
+      DB --> API : ok
+    end
+    API --> APP : 201 {userId, status: PENDING_VERIFICATION}
+    APP --> U : Экран «Введите код из письма»
+  end
+end
+
+== Подтверждение email ==
+U -> APP : Вводит код из письма
+APP -> API : POST /v1/auth/verify-email\n{email, code}
+API -> DB : Получить хеш кода,\nсрок и число попыток
+DB --> API : Данные кода
+alt Код верный и не просрочен
+  API -> DB : Активировать учётную запись (ACTIVE),\nаннулировать код
+  DB --> API : ok
+  API -> API : Выпустить access- и refresh-токены
+  API --> APP : 200 {accessToken, refreshToken}
+  APP --> U : Главный экран, вход выполнен
+else Код неверный или просрочен
+  API -> DB : Увеличить счётчик попыток
+  DB --> API : ok
+  API --> APP : 400 {code: INVALID_CODE}
+  APP --> U : Ошибка и кнопка\n«Отправить код повторно»
+end
+@enduml
